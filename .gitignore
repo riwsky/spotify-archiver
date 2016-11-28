@@ -2,6 +2,8 @@
 *.o
 *.a
 *.so
+spotify-archiver-auth-server/spotify-archiver-auth-server
+spotify-archiver-job/spotify-archiver-job
 
 # Folders
 _obj
@@ -22,3 +24,9 @@ _testmain.go
 *.exe
 *.test
 *.prof
+
+# secrets-containing run scripts and caches
+run.sh
+cache.json
+cache.json.bk
+deploy.sh
