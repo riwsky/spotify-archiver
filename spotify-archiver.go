@@ -2,6 +2,7 @@ package spotify_archiver
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +25,26 @@ type Api struct {
 	ClientSecret string
 	DB           *db.DB
 	Mutex        sync.Mutex
+}
+
+func mustHaveEnv(varName string) string {
+	out := os.Getenv(varName)
+	if out == "" {
+		log.Fatal("couldn't find ", varName, " in environment")
+	}
+	return out
+}
+
+func ApiFromEnv() Api {
+	loaded, err := db.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return Api{
+		ClientId:     mustHaveEnv("SPOTIFY_ARCHIVER_CLIENT_ID"),
+		ClientSecret: mustHaveEnv("SPOTIFY_ARCHIVER_CLIENT_SECRET"),
+		DB:           loaded,
+	}
 }
 
 func tracks(creds db.PerUserCreds, playlist types.PlaylistResponseItem, offset, limit int) (*types.TrackResponse, error) {
@@ -74,7 +96,7 @@ func playlists(creds db.PerUserCreds, offset, limit int) (*types.PlaylistRespons
 	var pitems types.PlaylistResponse
 	err := get(creds, url, offset, limit, &pitems)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("playlists: %v", err)
 	}
 	return &pitems, nil
 }
@@ -99,7 +121,8 @@ func (s *Api) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func do(req *http.Request, unmarshal func([]byte) error, tag string) error {
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("error getting %v: %v", tag, err)
 	}
@@ -115,7 +138,7 @@ func do(req *http.Request, unmarshal func([]byte) error, tag string) error {
 	return nil
 }
 
-func (s *Api) auth(code, grantType, grantKey string) (*types.AuthResponse, error) {
+func (s *Api) Auth(code, grantType, grantKey string) (*types.AuthResponse, error) {
 	log.Println("ClientId/secret " + s.ClientId + " " + s.ClientSecret)
 	urlStr := "https://accounts.spotify.com/api/token"
 	log.Println("Attempting to auth with ", code)
@@ -160,7 +183,7 @@ func (s *Api) Callback(w http.ResponseWriter, req *http.Request) {
 	}
 	code := req.Form["code"][0]
 	log.Println("got code " + code)
-	auth, err := s.auth(code, "authorization_code", "code")
+	auth, err := s.Auth(code, "authorization_code", "code")
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -181,15 +204,15 @@ func (s *Api) Callback(w http.ResponseWriter, req *http.Request) {
 
 func getAll(do func(offset, limit int) (*types.Paging, error)) error {
 	currentOffset := 0
-	currentLimit := 20
+	limit := 50
 	currentTotal := 100
-	for currentOffset+currentLimit < currentTotal {
-		paging, err := do(currentOffset, currentLimit)
+	for currentOffset < currentTotal {
+		paging, err := do(currentOffset, limit)
 		if err != nil {
 			return err
 		}
 		currentTotal = paging.Total
-		currentOffset = currentOffset + currentLimit
+		currentOffset = currentOffset + limit
 	}
 	return nil
 }
@@ -215,7 +238,10 @@ func getAllTracks(creds db.PerUserCreds, playlist types.PlaylistResponseItem) ([
 func Archive(creds db.PerUserCreds, playlists []string) error {
 	plists, err := getAllPlaylists(creds)
 	if err != nil {
-		return err
+		return fmt.Errorf("archiving: %v", err)
+	}
+	if len(plists) == 0 {
+		return fmt.Errorf("User %v had no playlists", creds)
 	}
 	pListsByName := make(map[string]types.PlaylistResponseItem, len(plists))
 	for _, plist := range plists {
@@ -283,7 +309,7 @@ func cloneName(name string, asOf time.Time) string {
 
 func shouldClone(playlists map[string]types.PlaylistResponseItem, asOf time.Time, name string) bool {
 	if _, ok := playlists[name]; !ok {
-		log.Print(name, " not found in original playlists list", playlists)
+		log.Print(name, " not found in original playlists list ", playlists)
 		return false
 	}
 	_, ok := playlists[cloneName(name, asOf)]
@@ -327,7 +353,11 @@ func clone(creds db.PerUserCreds, asOf time.Time, playlist types.PlaylistRespons
 	log.Printf("trying to add %v songs", len(uris))
 	url = fmt.Sprintf("https://api.spotify.com/v1/users/%v/playlists/%v/tracks", creds.Id, newp.Id)
 	for i := 0; i < len(uris); i = i + maxTracksPerPost {
-		err = post(creds, url, map[string]interface{}{"uris": uris[i : i+maxTracksPerPost]}, nil)
+		end := i + maxTracksPerPost
+		if end > len(uris) {
+			end = len(uris)
+		}
+		err = post(creds, url, map[string]interface{}{"uris": uris[i:end]}, nil)
 		if err != nil {
 			return err
 		}
